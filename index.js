@@ -1,10 +1,12 @@
 import "dotenv/config";
 import express from "express";
-import { pool, initDb, consume, bodyDefault, installErrorHandlers } from "./common.js";
+import { pool, initDb, consume, bodyDefault, installErrorHandlers,
+  authenticate, auditTrail, requireRole, isAdmin, sameEntity, jsonError } from "./common.js";
 
 const app = express();
 const PORT = process.env.PORT || 3008;
 
+app.disable("x-powered-by");
 app.use(express.json());
 app.use(bodyDefault);
 
@@ -31,10 +33,25 @@ app.get("/health", async (_, res) => {
 
 // El gateway quita el prefijo /notifications, así que el servicio expone /entity/:id.
 // La ruta antigua (/notifications/entity/:id) se mantiene por compatibilidad.
-app.get("/templates", async (_, res) => res.json((await pool.query("select * from templates")).rows));
-app.get(["/entity/:id", "/notifications/entity/:id"], async (req, res) =>
-  res.json((await pool.query(
-    "select * from notifications where entity_id=$1 order by created_at desc", [req.params.id])).rows));
+// 2.7: sesión obligatoria (C1). Cada usuario ve solo sus avisos (M1):
+//   - los de su propia entidad (su nombre);
+//   - admin y fabricante: también los avisos de recall de un lote (id del lote);
+//   - admin: además los avisos de fraude (por serial) y los del sistema.
+// 2.8: registro de auditoría (va antes de authenticate para anotar también los 401).
+app.use(auditTrail("notification", []));
+app.use(authenticate);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+app.get("/templates", requireRole("admin"), async (_, res) => res.json((await pool.query("select * from templates")).rows));
+app.get(["/entity/:id", "/notifications/entity/:id"], async (req, res) => {
+  const id = req.params.id;
+  const allowed = isAdmin(req) || sameEntity(id, req.auth.name) || (req.auth.role === "fabricante" && UUID_RE.test(id));
+  if (!allowed) return jsonError(res, 403, "Solo puedes consultar tus propias notificaciones");
+  const sql = UUID_RE.test(id) || isAdmin(req)
+    ? "select * from notifications where entity_id=$1 order by created_at desc"
+    : "select * from notifications where lower(trim(entity_id))=lower(trim($1)) order by created_at desc";
+  res.json((await pool.query(sql, [id])).rows);
+});
 
 const save = (entity, event, message) =>
   pool.query("insert into notifications(entity_id,event_type,message) values($1,$2,$3)", [entity, event, message]);
