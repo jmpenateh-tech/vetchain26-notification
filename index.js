@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { pool, initDb, consume, bodyDefault, installErrorHandlers,
-  authenticate, auditTrail, requireRole, isAdmin, sameEntity, jsonError } from "./common.js";
+  authenticate, auditTrail, requireRole, isAdmin, isMaster, sameEntity, jsonError, getScope, ScopeError } from "./common.js";
 
 const app = express();
 const PORT = process.env.PORT || 3008;
@@ -42,10 +42,20 @@ app.use(auditTrail("notification", []));
 app.use(authenticate);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-app.get("/templates", requireRole("admin"), async (_, res) => res.json((await pool.query("select * from templates")).rows));
+// 2.10: un admin consulta avisos de lotes (id de lote), de alertas (serial) y del sistema,
+// pero los avisos dirigidos a una ENTIDAD solo si esa entidad es de su ámbito.
+const SERIAL_ID_RE = /^[A-Z0-9]{1,10}-[0-9A-F]{8}-[A-Z0-9]{5,8}$/i;
+app.get("/templates", requireRole("admin", "master-admin"), async (_, res) => res.json((await pool.query("select * from templates")).rows));
 app.get(["/entity/:id", "/notifications/entity/:id"], async (req, res) => {
   const id = req.params.id;
-  const allowed = isAdmin(req) || sameEntity(id, req.auth.name) || (req.auth.role === "fabricante" && UUID_RE.test(id));
+  let allowed = isMaster(req) || sameEntity(id, req.auth.name) || (req.auth.role === "fabricante" && UUID_RE.test(id));
+  if (!allowed && isAdmin(req)) {
+    if (UUID_RE.test(id) || SERIAL_ID_RE.test(id) || id === "system") allowed = true;
+    else {
+      try { allowed = (await getScope(req)).has(id); }
+      catch (e) { if (e instanceof ScopeError) return jsonError(res, e.status, e.message); throw e; }
+    }
+  }
   if (!allowed) return jsonError(res, 403, "Solo puedes consultar tus propias notificaciones");
   const sql = UUID_RE.test(id) || isAdmin(req)
     ? "select * from notifications where entity_id=$1 order by created_at desc"
